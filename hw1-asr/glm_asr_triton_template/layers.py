@@ -806,6 +806,8 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=8,
+            num_stages=4,
         )
 
         output = output[:M, :N]
