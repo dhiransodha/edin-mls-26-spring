@@ -646,7 +646,7 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = 1024
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -663,7 +663,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = 1024
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
