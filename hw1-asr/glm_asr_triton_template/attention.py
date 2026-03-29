@@ -452,7 +452,7 @@ def flash_scaled_dot_product_attention(
         BLOCK_N=FLASH_BLOCK_N,
         BLOCK_D=BLOCK_D,
         num_warps=8,
-        num_stages=4,
+        num_stages=2,
     )
 
     if BLOCK_D != head_dim:
