@@ -12,6 +12,13 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
+# ============================================================================
+# BENCHMARK CONFIG — must match CONFIG in layers.py
+#   1-4 = FlashAttention OFF
+#   5   = FlashAttention ON
+# ============================================================================
+CONFIG = 5
+
 
 def get_stream():
     """Get current CUDA stream pointer."""
@@ -389,7 +396,7 @@ def next_power_of_two(x: int) -> int:
 # FlashAttention wrapper
 # ============================================================================
 
-USE_FLASH_ATTENTION = True   # toggle for ablation benchmarks
+USE_FLASH_ATTENTION = CONFIG >= 5   # True only for config 5
 FLASH_BLOCK_M = 64           # Q tile size along sequence dimension
 FLASH_BLOCK_N = 64           # K/V tile size along sequence dimension
 

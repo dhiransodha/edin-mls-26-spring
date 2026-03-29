@@ -14,6 +14,20 @@ import torch
 import triton
 import triton.language as tl
 
+# ============================================================================
+# BENCHMARK CONFIG — change this number to switch between configurations
+#   1 = baseline        (block=256, fusion OFF, default warps/stages)
+#   2 = +block size     (block=1024)
+#   3 = +fusion         (SwiGLU + linear-gelu fused kernels)
+#   4 = +warps/stages   (num_warps=8, num_stages=4 on linear kernel)
+#   5 = +FlashAttention (also set CONFIG=5 in attention.py)
+# ============================================================================
+CONFIG = 5
+
+_ELEM_BLOCK  = 256 if CONFIG == 1 else 1024   # gelu / silu block size
+_FUSED       = CONFIG >= 3                      # SwiGLU + linear-gelu fusion
+_LIN_WARPS   = 8   if CONFIG >= 4 else 4        # linear_kernel_tf32 num_warps
+_LIN_STAGES  = 4   if CONFIG >= 4 else 3        # linear_kernel_tf32 num_stages
 
 # ============================================================================
 # Helper Functions
@@ -646,7 +660,7 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 1024
+    block = _ELEM_BLOCK
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -663,7 +677,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 1024
+    block = _ELEM_BLOCK
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -806,8 +820,8 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
-            num_warps=8,
-            num_stages=4,
+            num_warps=_LIN_WARPS,
+            num_stages=_LIN_STAGES,
         )
 
         output = output[:M, :N]
@@ -896,7 +910,7 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
 class MLP:
     """MLP with SwiGLU gating using Triton."""
 
-    FUSED = True
+    FUSED = _FUSED
     TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
@@ -1023,7 +1037,7 @@ class MLP:
 class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
-    FUSED = True
+    FUSED = _FUSED
     TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
