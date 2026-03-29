@@ -4,7 +4,7 @@
 
 | Directory | Description |
 |-----------|-------------|
-| `glm_asr_triton_example/` | Provided reference implementation (Max's code) |
+| `glm_asr_triton_example/` | Provided baseline implementation |
 | `glm_asr_triton_template/` | Our Triton implementation with all optimisations |
 
 ---
@@ -38,7 +38,7 @@ CONFIG = 5   # change this number
 ```bash
 # Run from hw1-asr/
 bash benchmark.sh glm_asr_triton_template
-bash benchmark.sh glm_asr_triton_example   # reference baseline
+bash benchmark.sh glm_asr_triton_example   # baseline
 ```
 
 ### Component-level breakdown (benchmark_detailed.sh)
@@ -61,7 +61,7 @@ bash benchmark_detailed.sh glm_asr_triton_template
 
 | Config | Total (ms) | Prefill (ms) | Decode (ms/step) | Notes |
 |--------|-----------|--------------|------------------|-------|
-| Example baseline | 7555 | 845 | 60.9 | Reference (Max's code) |
+| Baseline | 7555 | 845 | 60.9 | Provided example |
 | Config 1 | 6442 | 1010 | 38.1 | Our template, no opts |
 | Config 2 | 6008 | 884 | 32.8 | +block=1024 (−6.7%) |
 | Config 3 | 7149 | 976 | 52.6 | +fusion (regression +19%) |
