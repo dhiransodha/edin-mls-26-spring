@@ -4,8 +4,8 @@
 
 | Directory | Description |
 |-----------|-------------|
-| `glm_asr_triton_example/` | Provided baseline implementation |
-| `glm_asr_triton_template/` | Our Triton implementation with all optimisations |
+| `glm_asr_triton_example/` | Baseline implementation |
+| `glm_asr_triton_template/` | Triton implementation with all optimisations |
 
 ---
 
@@ -46,24 +46,3 @@ bash benchmark.sh glm_asr_triton_example   # baseline
 bash benchmark_detailed.sh glm_asr_triton_template
 bash benchmark_detailed.sh glm_asr_triton_example
 ```
-
-### On the saxa node (H100)
-```bash
-srun --partition=Teaching --nodelist=saxa --gres=gpu:1 --mem=16G --pty bash
-source /opt/conda/bin/activate && conda activate mls
-cd edin-mls-26-spring/hw1-asr
-bash benchmark_detailed.sh glm_asr_triton_template
-```
-
----
-
-## Benchmark results summary (saxa H100, benchmark_detailed.sh)
-
-| Config | Total (ms) | Prefill (ms) | Decode (ms/step) | Notes |
-|--------|-----------|--------------|------------------|-------|
-| Baseline | 7555 | 845 | 60.9 | Provided example |
-| Config 1 | 6442 | 1010 | 38.1 | Our template, no opts |
-| Config 2 | 6008 | 884 | 32.8 | +block=1024 (−6.7%) |
-| Config 3 | 7149 | 976 | 52.6 | +fusion (regression +19%) |
-| Config 4 | 6168 | 448 | 45.2 | +warps/stages (prefill −49%) |
-| Config 5 | 5813 | 395 | 44.1 | +FlashAttention (−5.8%) |
