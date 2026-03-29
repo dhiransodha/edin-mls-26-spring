@@ -164,6 +164,121 @@ def attention_output_kernel(
 
 
 @triton.jit
+def flash_attention_kernel(
+    q_ptr, k_ptr, v_ptr, output_ptr,
+    mask_ptr,
+    seq_q, seq_k, head_dim,
+    scale,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_mb, stride_mq, stride_mk,
+    is_causal: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    FlashAttention-2 style kernel.
+    Each program handles a BLOCK_M x head_dim tile of the output.
+    Streams through K/V in BLOCK_N chunks, never materialising the full N×N
+    attention matrix in HBM. Running max (m) and sum (l) maintain a
+    numerically stable online softmax throughout.
+
+    Grid: (batch * num_heads, ceil(seq_q / BLOCK_M))
+    """
+    pid_bh = tl.program_id(0)
+    pid_m  = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # Load Q tile: (BLOCK_M, BLOCK_D)
+    q = tl.load(
+        q_ptr + pid_bh * stride_qb
+              + offs_m[:, None] * stride_qq
+              + offs_d[None, :] * stride_qd,
+        mask=(offs_m[:, None] < seq_q) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    # Running accumulators — stay in SRAM for the entire inner loop
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    o_i = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+    # Stream over K/V tiles — the key loop that avoids writing N×N to HBM
+    for start_n in range(0, seq_k, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        k = tl.load(
+            k_ptr + pid_bh * stride_kb
+                  + offs_n[:, None] * stride_kk
+                  + offs_d[None, :] * stride_kd,
+            mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        )
+        v = tl.load(
+            v_ptr + pid_bh * stride_vb
+                  + offs_n[:, None] * stride_vk
+                  + offs_d[None, :] * stride_vd,
+            mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        )
+
+        # S = Q @ K^T * scale  shape: (BLOCK_M, BLOCK_N)
+        s = tl.dot(q, tl.trans(k)) * scale
+
+        # Mask padding positions
+        s = tl.where(offs_n[None, :] < seq_k, s, float("-inf"))
+
+        # Causal mask: query at row i may only attend to key at col j if i >= j
+        if is_causal:
+            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+
+        # Additive attention mask (e.g. padding mask from the model)
+        if HAS_MASK:
+            m_tile = tl.load(
+                mask_ptr + pid_bh * stride_mb
+                         + offs_m[:, None] * stride_mq
+                         + offs_n[None, :] * stride_mk,
+                mask=(offs_m[:, None] < seq_q) & (offs_n[None, :] < seq_k),
+                other=0.0,
+            )
+            s = s + m_tile
+
+        # Online softmax — update running max without recomputing over all keys
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+
+        # Rescale factor for the previous accumulator (corrects for the new max)
+        # Guard -inf - (-inf) = nan on the very first iteration
+        delta = tl.where(m_i == float("-inf"), 0.0, m_i - m_new)
+        alpha = tl.exp(delta)
+
+        # Exponentiated scores for this tile
+        p = tl.exp(s - m_new[:, None])
+
+        # Update running sum and output
+        l_i = alpha * l_i + tl.sum(p, axis=1)
+        o_i = alpha[:, None] * o_i + tl.dot(p, v)
+
+        m_i = m_new
+
+    # Final normalisation
+    o_i = o_i / l_i[:, None]
+
+    tl.store(
+        output_ptr + pid_bh * stride_ob
+                   + offs_m[:, None] * stride_oq
+                   + offs_d[None, :] * stride_od,
+        o_i,
+        mask=(offs_m[:, None] < seq_q) & (offs_d[None, :] < head_dim),
+    )
+
+
+@triton.jit
 def causal_mask_kernel(
     scores_ptr,
     seq_k,
@@ -270,6 +385,84 @@ def next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length() if x > 0 else 1
 
 
+# ============================================================================
+# FlashAttention wrapper
+# ============================================================================
+
+USE_FLASH_ATTENTION = True   # toggle for ablation benchmarks
+FLASH_BLOCK_M = 64           # Q tile size along sequence dimension
+FLASH_BLOCK_N = 64           # K/V tile size along sequence dimension
+
+
+def flash_scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    batch, num_heads, seq_q, head_dim = q.shape
+    _, _, seq_k, _ = k.shape
+
+    if scale is None:
+        scale = 1.0 / np.sqrt(head_dim)
+
+    BLOCK_D = next_power_of_two(head_dim)
+    BH = batch * num_heads
+
+    q_flat = q.reshape(BH, seq_q, head_dim).to(torch.float32).contiguous()
+    k_flat = k.reshape(BH, seq_k, head_dim).to(torch.float32).contiguous()
+    v_flat = v.reshape(BH, seq_k, head_dim).to(torch.float32).contiguous()
+
+    # Pad head dim to power of two for tl.dot
+    if BLOCK_D != head_dim:
+        def _pad(t, n):
+            p = torch.zeros((*t.shape[:-1], BLOCK_D), dtype=t.dtype, device=t.device)
+            p[..., :n] = t
+            return p
+        q_flat = _pad(q_flat, head_dim)
+        k_flat = _pad(k_flat, head_dim)
+        v_flat = _pad(v_flat, head_dim)
+
+    output = torch.zeros((BH, seq_q, BLOCK_D), dtype=torch.float32, device=q.device)
+
+    has_mask = attention_mask is not None
+    if has_mask:
+        mask_flat = attention_mask.reshape(BH, seq_q, seq_k).to(torch.float32).contiguous()
+        s_mb, s_mq, s_mk = mask_flat.stride(0), mask_flat.stride(1), mask_flat.stride(2)
+    else:
+        mask_flat = q_flat   # dummy — never accessed when HAS_MASK=False
+        s_mb = s_mq = s_mk = 0
+
+    grid = (BH, triton.cdiv(seq_q, FLASH_BLOCK_M))
+    flash_attention_kernel[grid](
+        q_flat, k_flat, v_flat, output,
+        mask_flat,
+        seq_q, seq_k, head_dim,
+        float(scale),
+        q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+        k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+        v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+        output.stride(0), output.stride(1), output.stride(2),
+        s_mb, s_mq, s_mk,
+        is_causal=is_causal,
+        HAS_MASK=has_mask,
+        BLOCK_M=FLASH_BLOCK_M,
+        BLOCK_N=FLASH_BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        num_warps=8,
+        num_stages=4,
+    )
+
+    if BLOCK_D != head_dim:
+        output = output[..., :head_dim]
+
+    return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+
+
+# ============================================================================
+
 MAX_ATTENTION_DIM = 256
 
 
@@ -289,6 +482,10 @@ def scaled_dot_product_attention(
 
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
+
+    # FlashAttention path — single fused kernel, no N×N matrix in HBM
+    if q.is_cuda and USE_FLASH_ATTENTION:
+        return flash_scaled_dot_product_attention(q, k, v, attention_mask, is_causal, scale)
 
     seq_k_padded = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)
